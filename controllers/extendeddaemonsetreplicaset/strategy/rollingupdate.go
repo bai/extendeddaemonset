@@ -11,12 +11,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	datadoghqv1alpha1 "github.com/DataDog/extendeddaemonset/api/v1alpha1"
+	eds "github.com/DataDog/extendeddaemonset/controllers/extendeddaemonset"
 	"github.com/DataDog/extendeddaemonset/controllers/extendeddaemonsetreplicaset/conditions"
 	"github.com/DataDog/extendeddaemonset/controllers/extendeddaemonsetreplicaset/strategy/limits"
 	"github.com/DataDog/extendeddaemonset/pkg/controller/utils"
@@ -24,19 +24,26 @@ import (
 )
 
 // cleanCanaryLabelsThreshold is the duration since the last transition to a rolling update of a replicaset
-// during which we keep retrying cleaning up the canary labels that were added to the canary pods during the canary phase
+// during which we keep retrying cleaning up the canary labels that were added to the canary pods during the canary phase.
 const cleanCanaryLabelsThreshold = 5 * time.Minute
 
-// ManageDeployment used to manage ReplicaSet in rollingupdate state
-func ManageDeployment(client runtimeclient.Client, params *Parameters) (*Result, error) {
-	result := &Result{}
+// ManageDeployment used to manage ReplicaSet in rollingupdate state.
+func ManageDeployment(client runtimeclient.Client, daemonset *datadoghqv1alpha1.ExtendedDaemonSet, params *Parameters) (*Result, error) {
+	now := time.Now()
+	metaNow := metav1.NewTime(now)
+	result := &Result{
+		IsPaused: eds.IsRollingUpdatePaused(daemonset.GetAnnotations()),
+		IsFrozen: eds.IsRolloutFrozen(daemonset.GetAnnotations()),
+	}
+	conditions.UpdateExtendedDaemonSetReplicaSetStatusCondition(params.NewStatus, metaNow, datadoghqv1alpha1.ConditionTypeRollingUpdatePaused, conditions.BoolToCondition(result.IsPaused), "", "", false, false)
+	conditions.UpdateExtendedDaemonSetReplicaSetStatusCondition(params.NewStatus, metaNow, datadoghqv1alpha1.ConditionTypeRolloutFrozen, conditions.BoolToCondition(result.IsFrozen), "", "", false, false)
+	conditions.UpdateExtendedDaemonSetReplicaSetStatusCondition(params.NewStatus, metaNow, datadoghqv1alpha1.ConditionTypeActive, conditions.BoolToCondition(!result.IsPaused && !result.IsFrozen), "", "", false, false)
 
-	// remove canary node if define
+	// Remove canary nodes if defined.
 	for _, nodeName := range params.CanaryNodes {
 		delete(params.PodByNodeName, params.NodeByName[nodeName])
 	}
-	now := time.Now()
-	metaNow := metav1.NewTime(now)
+
 	var desiredPods, availablePods, readyPods, createdPods, allPods, oldAvailablePods, podsTerminating, nbIgnoredUnresponsiveNodes int32
 
 	allPodToCreate := []*NodeItem{}
@@ -47,6 +54,7 @@ func ManageDeployment(client runtimeclient.Client, params *Parameters) (*Result,
 	maxPodSchedulerFailure, err := intstrutil.GetValueFromIntOrPercent(params.Strategy.RollingUpdate.MaxPodSchedulerFailure, nbNodes, true)
 	if err != nil {
 		params.Logger.Error(err, "unable to retrieve maxPodSchedulerFailure from the strategy.RollingUpdate.MaxPodSchedulerFailure parameter")
+
 		return result, err
 	}
 
@@ -57,6 +65,7 @@ func ManageDeployment(client runtimeclient.Client, params *Parameters) (*Result,
 		} else {
 			if podutils.HasPodSchedulerIssue(pod) && int(nbIgnoredUnresponsiveNodes) < maxPodSchedulerFailure {
 				nbIgnoredUnresponsiveNodes++
+
 				continue
 			}
 
@@ -66,6 +75,7 @@ func ManageDeployment(client runtimeclient.Client, params *Parameters) (*Result,
 					allPodToDelete = append(allPodToDelete, node)
 				} else {
 					podsTerminating++
+
 					continue
 				}
 				if podutils.IsPodAvailable(pod, 0, metaNow) {
@@ -87,6 +97,7 @@ func ManageDeployment(client runtimeclient.Client, params *Parameters) (*Result,
 	maxUnavailable, err := intstrutil.GetValueFromIntOrPercent(params.Strategy.RollingUpdate.MaxUnavailable, nbNodes, true)
 	if err != nil {
 		params.Logger.Error(err, "unable to retrieve maxUnavailable pod from the strategy.RollingUpdate.MaxUnavailable parameter")
+
 		return result, err
 	}
 
@@ -94,6 +105,7 @@ func ManageDeployment(client runtimeclient.Client, params *Parameters) (*Result,
 	maxCreation, err := calculateMaxCreation(&params.Strategy.RollingUpdate, nbNodes, rollingUpdateStartTime, now)
 	if err != nil {
 		params.Logger.Error(err, "error during calculateMaxCreation execution")
+
 		return result, err
 	}
 	params.Logger.V(1).Info("Parameters", "nbNodes", nbNodes, "createdPods", createdPods, "allPods", allPods, "nbPodReady", readyPods, "availablePods", availablePods, "oldAvailablePods", oldAvailablePods, "maxPodsCreation", maxCreation, "maxUnavailable", maxUnavailable, "nbPodToCreate", len(allPodToCreate), "nbPodToDelete", len(allPodToDelete), "podsTerminating", podsTerminating)
@@ -111,10 +123,27 @@ func ManageDeployment(client runtimeclient.Client, params *Parameters) (*Result,
 	nbPodToCreate, nbPodToDelete := limits.CalculatePodToCreateAndDelete(limitParams)
 	nbPodToDeleteWithConstraint := utils.MinInt(nbPodToDelete, len(allPodToDelete))
 	nbPodToCreateWithConstraint := utils.MinInt(nbPodToCreate, len(allPodToCreate))
-	params.Logger.V(1).Info("Pods actions with limits", "nbPodToDelete", nbPodToDelete, "nbPodToCreate", nbPodToCreate, "nbPodToDeleteWithConstraint", nbPodToDeleteWithConstraint, "nbPodToCreateWithConstraint", nbPodToCreateWithConstraint)
+	params.Logger.V(1).Info(
+		"Pods actions with limits",
+		"nbPodToDelete", nbPodToDelete,
+		"nbPodToCreate", nbPodToCreate,
+		"nbPodToDeleteWithConstraint", nbPodToDeleteWithConstraint,
+		"nbPodToCreateWithConstraint", nbPodToCreateWithConstraint,
+		"isRolloutFrozen", result.IsFrozen,
+		"isRollingUpdatePaused", result.IsPaused,
+	)
 
-	result.PodsToDelete = allPodToDelete[:nbPodToDeleteWithConstraint]
-	result.PodsToCreate = allPodToCreate[:nbPodToCreateWithConstraint]
+	// When paused, we only stop deleting pods.
+	// The goal is to pause rolling out the new replicaset but also to continue creating pods
+	// if new nodes join in the meantime.
+	// When frozen, we stop both the deletion and the creation of new pods.
+	if !result.IsPaused && !result.IsFrozen {
+		result.PodsToDelete = allPodToDelete[:nbPodToDeleteWithConstraint]
+	}
+	if !result.IsFrozen {
+		result.PodsToCreate = allPodToCreate[:nbPodToCreateWithConstraint]
+	}
+
 	{
 		result.NewStatus = params.NewStatus.DeepCopy()
 		result.NewStatus.Status = string(ReplicaSetStatusActive)
@@ -170,6 +199,7 @@ func getRollingUpdateStartTime(status *datadoghqv1alpha1.ExtendedDaemonSetReplic
 	if cond.Status == corev1.ConditionTrue {
 		return cond.LastTransitionTime.Time
 	}
+
 	return now
 }
 
